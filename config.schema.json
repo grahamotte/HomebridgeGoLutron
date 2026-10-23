@@ -1,0 +1,24 @@
+{
+  "pluginAlias": "GoLutron",
+  "pluginType": "platform",
+  "singular": true,
+  "strictValidation": true,
+  "headerDisplay": "Lutron Caséta bridges are discovered automatically. The first time a bridge is found, press the small black button on the back of the bridge to pair.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "GoLutron"
+      },
+      "host": {
+        "title": "Bridge address",
+        "description": "Optional. Use this only when mDNS discovery is blocked on your network.",
+        "type": "string",
+        "placeholder": "192.168.1.192",
+        "pattern": "^[A-Za-z0-9.:-]+$"
+      }
+    }
+  }
+}
