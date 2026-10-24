@@ -21,3 +21,8 @@ export const DEFAULT_TIMING: BridgeTiming = {
   reconnectMinMs: 1000,
   reconnectMaxMs: 60000
 };
+
+export const DEFAULT_PRESS_TIMING = {
+  longPressMs: 600,
+  doublePressMs: 400
+};

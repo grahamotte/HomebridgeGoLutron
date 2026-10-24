@@ -8,6 +8,7 @@ import { CredentialStore } from "../dist/store.js";
 export const BRIDGE_ID = "067D50DC";
 export const BRIDGE_HOST = "192.168.1.192";
 export const CREDENTIALS = { ca: "ROOT CA", cert: "CLIENT CERT", key: "CLIENT KEY" };
+export const FAST_PRESS_TIMING = { longPressMs: 40, doublePressMs: 20 };
 export const FAST_TIMING = { requestTimeoutMs: 500, pingIntervalMs: 60000, reconnectMinMs: 1, reconnectMaxMs: 8 };
 
 export const DEVICES = [
@@ -48,6 +49,7 @@ export const DEVICES = [
     SerialNumber: 81234567,
     FullyQualifiedName: ["Living Room", "Pico"],
     ModelNumber: "PJ2-3BRL-GXX-X01",
+    ButtonGroups: [{ href: "/buttongroup/2" }],
     AddressedState: "Addressed"
   },
   {
@@ -61,9 +63,18 @@ export const DEVICES = [
   }
 ];
 
+export const BUTTONS = [
+  { href: "/button/104", ButtonNumber: 2, Parent: { href: "/buttongroup/2" }, Name: "Button 3" },
+  { href: "/button/102", ButtonNumber: 0, Parent: { href: "/buttongroup/2" }, Name: "Button 1" },
+  { href: "/button/103", ButtonNumber: 1, Parent: { href: "/buttongroup/2" }, Name: "Button 2" },
+  { href: "/button/105", ButtonNumber: 3, Parent: { href: "/buttongroup/2" }, Name: "Button 4" },
+  { href: "/button/106", ButtonNumber: 4, Parent: { href: "/buttongroup/2" }, Name: "Button 5" }
+];
+
 export class FakeBridge {
   constructor() {
     this.devices = structuredClone(DEVICES);
+    this.buttons = structuredClone(BUTTONS);
     this.levels = new Map([["/zone/1", 100], ["/zone/3", 0], ["/zone/20", 50]]);
     this.sockets = [];
     this.options = [];
@@ -109,6 +120,11 @@ export class FakeBridge {
       socket.send({ CommuniqueType: "ReadResponse", Header: reply(header, "200 OK"), Body: { PingResponse: { LEAPVersion: 1.124 } } });
     } else if (type === "ReadRequest" && header.Url === "/area/status") {
       socket.send({ CommuniqueType: "ReadResponse", Header: reply(header, "204 NoContent") });
+    } else if (type === "ReadRequest" && header.Url === "/button") {
+      socket.send({ CommuniqueType: "ReadResponse", Header: reply(header, "200 OK"), ...(this.buttons ? { Body: { Buttons: this.buttons } } : {}) });
+    } else if (type === "SubscribeRequest" && /^\/button\/\d+\/status\/event$/u.test(header.Url)) {
+      socket.buttons.set(header.Url.replace("/status/event", ""), header.ClientTag);
+      socket.send({ CommuniqueType: "SubscribeResponse", Header: reply(header, "204 NoContent") });
     } else if (type === "SubscribeRequest" && header.Url === "/zone/status") {
       socket.subscription = header.ClientTag;
       socket.send({ CommuniqueType: "SubscribeResponse", Header: reply(header, "200 OK"), Body: { ZoneStatuses: this.statuses() } });
@@ -157,6 +173,16 @@ export class FakeBridge {
     }
   }
 
+  buttonEvent(button, event) {
+    for (const socket of this.open.filter((candidate) => candidate.options.port === 8081 && candidate.buttons.has(button))) {
+      socket.send({
+        CommuniqueType: "ReadResponse",
+        Header: { MessageBodyType: "OneButtonStatusEvent", StatusCode: "200 OK", Url: `${button}/status/event`, ClientTag: socket.buttons.get(button) },
+        Body: { ButtonStatus: { Button: { href: button }, ButtonEvent: { EventType: event } } }
+      });
+    }
+  }
+
   drop() {
     for (const socket of this.open) {
       socket.destroy();
@@ -180,6 +206,7 @@ export class FakeSocket extends EventEmitter {
     this.destroyed = false;
     this.writes = [];
     this.pressed = false;
+    this.buttons = new Map();
     setImmediate(() => {
       if (bridge.refuse > 0) {
         bridge.refuse -= 1;
@@ -306,6 +333,9 @@ export function createApi(storagePath) {
     hap: {
       Characteristic: {
         CurrentPosition: { name: "CurrentPosition" },
+        ProgrammableSwitchEvent: { name: "ProgrammableSwitchEvent", SINGLE_PRESS: 0, DOUBLE_PRESS: 1, LONG_PRESS: 2 },
+        ServiceLabelIndex: { name: "ServiceLabelIndex" },
+        ServiceLabelNamespace: { name: "ServiceLabelNamespace", DOTS: 0, ARABIC_NUMERALS: 1 },
         Manufacturer: { name: "Manufacturer" },
         Model: { name: "Model" },
         Name: { name: "Name" },
@@ -315,6 +345,8 @@ export function createApi(storagePath) {
       },
       Service: {
         AccessoryInformation: "AccessoryInformation",
+        ServiceLabel: "ServiceLabel",
+        StatelessProgrammableSwitch: { UUID: "StatelessProgrammableSwitch" },
         WindowCovering: "WindowCovering"
       },
       uuid: {
@@ -344,23 +376,38 @@ export class FakePlatformAccessory {
     this.context = {};
     this.displayName = displayName;
     this.UUID = uuid;
-    this.services = new Map();
+    this.services = [];
     this.addService("AccessoryInformation");
   }
 
-  addService(name) {
-    const service = new FakeService();
-    this.services.set(name, service);
+  addService(type, displayName, subtype) {
+    const service = new FakeService(serviceUuid(type), displayName, subtype);
+    this.services.push(service);
     return service;
   }
 
-  getService(name) {
-    return this.services.get(name);
+  getService(type) {
+    return this.services.find((service) => service.UUID === serviceUuid(type));
+  }
+
+  getServiceById(type, subtype) {
+    return this.services.find((service) => service.UUID === serviceUuid(type) && service.subtype === subtype);
+  }
+
+  removeService(service) {
+    this.services = this.services.filter((candidate) => candidate !== service);
   }
 }
 
+function serviceUuid(type) {
+  return typeof type === "string" ? type : type.UUID;
+}
+
 class FakeService {
-  constructor() {
+  constructor(UUID, displayName, subtype) {
+    this.UUID = UUID;
+    this.displayName = displayName;
+    this.subtype = subtype;
     this.characteristics = new Map();
   }
 
@@ -379,6 +426,21 @@ class FakeService {
 }
 
 class FakeCharacteristic {
+  constructor() {
+    this.events = [];
+  }
+
+  setProps(props) {
+    this.props = props;
+    return this;
+  }
+
+  sendEventNotification(value) {
+    this.value = value;
+    this.events.push(value);
+    return this;
+  }
+
   onGet(handler) {
     this.getHandler = handler;
     return this;
@@ -419,6 +481,7 @@ export function createPlatform({ config = {}, fake = new FakeBridge(), discovere
       return typeof discovered === "function" ? discovered() : discovered;
     },
     timing: FAST_TIMING,
+    pressTiming: FAST_PRESS_TIMING,
     pairingTimeoutMs: 5000,
     ...options
   });

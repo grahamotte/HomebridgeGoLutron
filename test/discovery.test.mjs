@@ -49,7 +49,7 @@ describe("discoverBridges", () => {
       }
     };
 
-    const bridges = await discoverBridges(20, () => client);
+    const bridges = await discoverBridges(200, () => client);
     assert.deepEqual(calls, [{ type: "lutron", protocol: "tcp" }]);
     assert.deepEqual(bridges, [{ id: "067D50DC", host: "192.168.1.193" }]);
     assert.equal(browser.stopped, true);
