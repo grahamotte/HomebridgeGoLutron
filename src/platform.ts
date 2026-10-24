@@ -10,11 +10,14 @@ import type {
   Service
 } from "homebridge";
 import { ShadeAccessory } from "./accessory.js";
-import { identify, LutronBridge, type Shade } from "./bridge.js";
+import { identify, LutronBridge, type Pico, type Shade } from "./bridge.js";
 import { discoverBridges, type DiscoveredBridge } from "./discovery.js";
 import { describe, type SocketFactory } from "./leap.js";
 import { pair } from "./pairing.js";
+import { PicoAccessory } from "./pico.js";
+import type { PressTiming } from "./press.js";
 import {
+  DEFAULT_PRESS_TIMING,
   DEFAULT_TIMING,
   DISCOVERY_INTERVAL_MS,
   DISCOVERY_TIMEOUT_MS,
@@ -29,6 +32,7 @@ import { CredentialStore, type BridgeRecord } from "./store.js";
 interface Context {
   bridge?: string;
   shade?: Shade;
+  pico?: Pico;
 }
 
 export interface PlatformDependencies {
@@ -36,6 +40,7 @@ export interface PlatformDependencies {
   readonly discover?: (timeoutMs: number) => Promise<DiscoveredBridge[]>;
   readonly storagePath?: string;
   readonly timing?: Partial<BridgeTiming>;
+  readonly pressTiming?: Partial<PressTiming>;
   readonly discoveryIntervalMs?: number;
   readonly pairingTimeoutMs?: number;
 }
@@ -46,9 +51,11 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
   public readonly store: CredentialStore;
   private readonly accessories = new Map<string, PlatformAccessory>();
   private readonly controllers = new Map<string, ShadeAccessory>();
+  private readonly picos = new Map<string, PicoAccessory>();
   private readonly bridges = new Map<string, LutronBridge>();
   private readonly host?: string;
   private readonly timing: BridgeTiming;
+  private readonly pressTiming: PressTiming;
   private refreshing?: Promise<void>;
   private refreshTimer?: ReturnType<typeof setInterval>;
   private stopped = false;
@@ -63,6 +70,7 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
     this.timing = { ...DEFAULT_TIMING, ...dependencies.timing };
+    this.pressTiming = { ...DEFAULT_PRESS_TIMING, ...dependencies.pressTiming };
     this.store = new CredentialStore(path.join(dependencies.storagePath ?? api.user.storagePath(), STORAGE_DIRECTORY));
     const host = typeof config.host === "string" ? config.host.trim() : "";
     if (host && (net.isIP(host) || /^[A-Za-z0-9.-]+$/u.test(host))) {
@@ -99,6 +107,9 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
     }
 
     this.bridges.clear();
+    for (const pico of this.picos.values()) {
+      pico.reset();
+    }
   }
 
   refresh(): Promise<void> {
@@ -204,9 +215,14 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
       warn: (message: string) => this.log.warn(message)
     };
     const bridge: LutronBridge = new LutronBridge(record, log, {
-      shades: (shades) => this.syncShades(bridge, shades),
+      devices: (shades, picos) => this.syncDevices(bridge, shades, picos),
       level: (zone, level) => this.applyLevel(bridge.id, zone, level),
-      online: () => undefined
+      button: (button, event) => this.applyButton(bridge.id, button, event),
+      online: (online) => {
+        if (!online) {
+          this.resetPicos(bridge.id);
+        }
+      }
     }, this.dependencies.connect, this.timing);
     this.bridges.set(record.id, bridge);
     for (const [uuid, accessory] of this.accessories) {
@@ -214,18 +230,21 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
       if (context.bridge === bridge.id && context.shade && !this.controllers.has(uuid)) {
         this.controllers.set(uuid, new ShadeAccessory(this, accessory, context.shade, bridge));
       }
+
+      if (context.bridge === bridge.id && context.pico && !this.picos.has(uuid)) {
+        this.picos.set(uuid, new PicoAccessory(this, accessory, context.pico, this.pressTiming));
+      }
     }
 
     bridge.start();
   }
 
-  private syncShades(bridge: LutronBridge, shades: readonly Shade[]): void {
+  // A Pico list of undefined means the bridge could not report its buttons, so cached Picos are kept as they are.
+  private syncDevices(bridge: LutronBridge, shades: readonly Shade[], picos?: readonly Pico[]): void {
     const seen = new Set<string>();
     for (const shade of shades) {
-      const uuid = this.api.hap.uuid.generate(`${PLUGIN_NAME}:${bridge.id}:${shade.serial}`);
+      const { uuid, accessory, cached } = this.accessoryFor(bridge, shade.serial, shade.name);
       seen.add(uuid);
-      const cached = this.accessories.get(uuid);
-      const accessory = cached ?? new this.api.platformAccessory(shade.name, uuid);
       const context = accessory.context as Context;
       context.bridge = bridge.id;
       context.shade = { ...shade };
@@ -236,22 +255,53 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
         this.controllers.set(uuid, new ShadeAccessory(this, accessory, shade, bridge));
       }
 
-      if (cached) {
-        this.api.updatePlatformAccessories([accessory]);
+      this.publish(accessory, cached, `shade ${shade.name}`);
+    }
+
+    for (const pico of picos ?? []) {
+      const { uuid, accessory, cached } = this.accessoryFor(bridge, pico.serial, pico.name);
+      seen.add(uuid);
+      const context = accessory.context as Context;
+      context.bridge = bridge.id;
+      context.pico = { ...pico, buttons: pico.buttons.map((button) => ({ ...button })) };
+      const controller = this.picos.get(uuid);
+      if (controller) {
+        controller.update(pico);
       } else {
-        this.log.info(`Adding shade ${shade.name}.`);
-        this.accessories.set(uuid, accessory);
-        this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+        this.picos.set(uuid, new PicoAccessory(this, accessory, pico, this.pressTiming));
       }
+
+      this.publish(accessory, cached, `Pico ${pico.name}`);
     }
 
     for (const [uuid, accessory] of this.accessories) {
-      if (!seen.has(uuid) && (accessory.context as Context).bridge === bridge.id) {
-        this.log.warn(`Removing shade ${accessory.displayName}; the bridge no longer reports it.`);
-        this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
-        this.accessories.delete(uuid);
-        this.controllers.delete(uuid);
+      const context = accessory.context as Context;
+      if (seen.has(uuid) || context.bridge !== bridge.id || (picos === undefined && context.pico)) {
+        continue;
       }
+
+      this.log.warn(`Removing ${context.pico ? "Pico" : "shade"} ${accessory.displayName}; the bridge no longer reports it.`);
+      this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+      this.accessories.delete(uuid);
+      this.controllers.delete(uuid);
+      this.picos.get(uuid)?.reset();
+      this.picos.delete(uuid);
+    }
+  }
+
+  private accessoryFor(bridge: LutronBridge, serial: string, name: string): { uuid: string; accessory: PlatformAccessory; cached: boolean } {
+    const uuid = this.api.hap.uuid.generate(`${PLUGIN_NAME}:${bridge.id}:${serial}`);
+    const cached = this.accessories.get(uuid);
+    return { uuid, accessory: cached ?? new this.api.platformAccessory(name, uuid), cached: cached !== undefined };
+  }
+
+  private publish(accessory: PlatformAccessory, cached: boolean, label: string): void {
+    if (cached) {
+      this.api.updatePlatformAccessories([accessory]);
+    } else {
+      this.log.info(`Adding ${label}.`);
+      this.accessories.set(accessory.UUID, accessory);
+      this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     }
   }
 
@@ -259,6 +309,22 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
     for (const [uuid, controller] of this.controllers) {
       if (controller.zone === zone && (this.accessories.get(uuid)?.context as Context | undefined)?.bridge === bridge) {
         controller.setLevel(level);
+      }
+    }
+  }
+
+  private applyButton(bridge: string, button: string, event: string): void {
+    for (const [uuid, controller] of this.picos) {
+      if (controller.has(button) && (this.accessories.get(uuid)?.context as Context | undefined)?.bridge === bridge) {
+        controller.handle(button, event);
+      }
+    }
+  }
+
+  private resetPicos(bridge: string): void {
+    for (const [uuid, controller] of this.picos) {
+      if ((this.accessories.get(uuid)?.context as Context | undefined)?.bridge === bridge) {
+        controller.reset();
       }
     }
   }

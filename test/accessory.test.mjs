@@ -5,7 +5,7 @@ import { createPlatform, until } from "./fakes.mjs";
 async function createShade() {
   const context = createPlatform();
   context.platform.start();
-  await until(() => context.api.registered.length === 2);
+  await until(() => context.api.registered.length === 3);
   const accessory = context.api.registered[0];
   const covering = accessory.getService("WindowCovering");
   const characteristic = (name) => covering.getCharacteristic({ name });

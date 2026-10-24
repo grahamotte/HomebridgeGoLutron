@@ -2,8 +2,8 @@
   "name": "homebridge-go-lutron",
   "displayName": "GoLutron",
   "type": "module",
-  "version": "0.1.0",
-  "description": "A Homebridge plugin for Lutron Caséta shades over the local LEAP API",
+  "version": "0.2.0",
+  "description": "A Homebridge plugin for Lutron Caséta shades and Pico remotes over the local LEAP API",
   "author": "Graham Otte",
   "license": "Apache-2.0",
   "homepage": "https://github.com/grahamotte/HomebridgeGoLutron",
@@ -19,7 +19,8 @@
     "lutron",
     "caseta",
     "leap",
-    "shades"
+    "shades",
+    "pico"
   ],
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

@@ -4,22 +4,24 @@ import { BRIDGE_HOST, BRIDGE_ID, createPlatform, FakeBridge, FakePlatformAccesso
 
 const LIVING = `uuid:homebridge-go-lutron:${BRIDGE_ID}:79430373`;
 const MASTER = `uuid:homebridge-go-lutron:${BRIDGE_ID}:70492003`;
+const PICO = `uuid:homebridge-go-lutron:${BRIDGE_ID}:81234567`;
 
 
 describe("GoLutronPlatform", () => {
   it("registers each shade from a paired bridge", async () => {
     const { api, discoveries, fake, messages } = createPlatform();
     api.emit("didFinishLaunching");
-    await until(() => api.registered.length === 2);
+    await until(() => api.registered.length === 3);
 
     assert.deepEqual(discoveries, [5000]);
     assert.deepEqual(api.registered.map((accessory) => [accessory.displayName, accessory.UUID, accessory.context.bridge]), [
       ["Living Room Shade 2", LIVING, BRIDGE_ID],
-      ["Master Bedroom Shade 1", MASTER, BRIDGE_ID]
+      ["Master Bedroom Shade 1", MASTER, BRIDGE_ID],
+      ["Living Room Pico", PICO, BRIDGE_ID]
     ]);
     assert.equal(api.registered[0].context.shade.zone, "/zone/1");
     assert.equal(api.registered[0].getService("WindowCovering").getCharacteristic({ name: "CurrentPosition" }).value, 100);
-    assert.deepEqual(messages.info.slice(0, 2), ["Adding shade Living Room Shade 2.", "Adding shade Master Bedroom Shade 1."]);
+    assert.deepEqual(messages.info.slice(0, 3), ["Adding shade Living Room Shade 2.", "Adding shade Master Bedroom Shade 1.", "Adding Pico Living Room Pico."]);
     assert.equal(fake.options[0].host, BRIDGE_HOST);
     api.emit("shutdown");
     await until(() => fake.open.length === 0);
@@ -59,8 +61,8 @@ describe("GoLutronPlatform", () => {
     }
 
     platform.start();
-    await until(() => api.registered.length === 1);
-    assert.deepEqual(api.registered.map((accessory) => accessory.UUID), [MASTER]);
+    await until(() => api.registered.length === 2);
+    assert.deepEqual(api.registered.map((accessory) => accessory.UUID), [MASTER, PICO]);
     assert.deepEqual(api.updated, [living]);
     assert.deepEqual(api.unregistered, [gone]);
     assert.ok(messages.warn.includes("Removing shade Gone; the bridge no longer reports it."));
@@ -75,7 +77,7 @@ describe("GoLutronPlatform", () => {
     assert.ok(messages.warn.includes(`Found an unpaired Lutron bridge at ${BRIDGE_HOST}. Press the small black button on the back of the bridge to pair.`));
 
     fake.pressButton();
-    await until(() => api.registered.length === 2);
+    await until(() => api.registered.length === 3);
     const [record] = store.list();
     assert.deepEqual([record.id, record.host, record.ca, record.cert], [BRIDGE_ID, BRIDGE_HOST, "BRIDGE ROOT", "SIGNED CERT"]);
     assert.match(record.key, /BEGIN PRIVATE KEY/u);
@@ -97,7 +99,7 @@ describe("GoLutronPlatform", () => {
   it("follows a bridge that changed address", async () => {
     const { api, fake, platform, store } = createPlatform({ discovered: [{ id: BRIDGE_ID, host: "192.168.1.77" }] });
     platform.start();
-    await until(() => api.registered.length === 2);
+    await until(() => api.registered.length === 3);
 
     assert.equal(fake.options[0].host, "192.168.1.77");
     assert.equal(store.list()[0].host, "192.168.1.77");
@@ -108,7 +110,7 @@ describe("GoLutronPlatform", () => {
     let host = BRIDGE_HOST;
     const { api, fake, messages, platform } = createPlatform({ discovered: () => [{ id: BRIDGE_ID, host }] });
     platform.start();
-    await until(() => api.registered.length === 2);
+    await until(() => api.registered.length === 3);
 
     host = "192.168.1.78";
     await platform.refresh();
@@ -120,7 +122,7 @@ describe("GoLutronPlatform", () => {
   it("uses a configured host instead of mDNS", async () => {
     const { api, discoveries, fake, platform } = createPlatform({ config: { host: " 192.168.1.80 " } });
     platform.start();
-    await until(() => api.registered.length === 2);
+    await until(() => api.registered.length === 3);
 
     assert.deepEqual(discoveries, []);
     assert.equal(fake.options[0].host, "192.168.1.80");

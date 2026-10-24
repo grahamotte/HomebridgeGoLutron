@@ -1,18 +1,22 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { identify, isShadeType, LutronBridge, parseShades } from "../dist/bridge.js";
-import { BRIDGE_HOST, BRIDGE_ID, CREDENTIALS, DEVICES, FakeBridge, FAST_TIMING, settle, until } from "./fakes.mjs";
+import { identify, isPicoType, isShadeType, LutronBridge, parsePicos, parseShades } from "../dist/bridge.js";
+import { BRIDGE_HOST, BRIDGE_ID, BUTTONS, CREDENTIALS, DEVICES, FakeBridge, FAST_TIMING, settle, until } from "./fakes.mjs";
 
 function createBridge(fake = new FakeBridge(), timing = {}) {
   const logs = { debug: [], info: [], warn: [] };
-  const events = { shades: [], levels: [], online: [] };
+  const events = { shades: [], picos: [], levels: [], buttons: [], online: [] };
   const bridge = new LutronBridge({ id: BRIDGE_ID, host: BRIDGE_HOST, ...CREDENTIALS }, {
     debug: (message) => logs.debug.push(message),
     info: (message) => logs.info.push(message),
     warn: (message) => logs.warn.push(message)
   }, {
-    shades: (shades) => events.shades.push(shades),
+    devices: (shades, picos) => {
+      events.shades.push(shades);
+      events.picos.push(picos);
+    },
     level: (zone, level) => events.levels.push([zone, level]),
+    button: (button, event) => events.buttons.push([button, event]),
     online: (online) => events.online.push(online)
   }, fake.connect, { ...FAST_TIMING, ...timing });
   return { bridge, events, fake, logs };
@@ -33,11 +37,87 @@ describe("LutronBridge", () => {
     ]);
     assert.deepEqual(events.levels, [["/zone/1", 100], ["/zone/3", 0], ["/zone/20", 50]]);
     assert.deepEqual(events.online, [true]);
-    assert.deepEqual(logs.info, [`Connected to bridge ${BRIDGE_ID} at ${BRIDGE_HOST} with 2 shade(s).`]);
+    assert.deepEqual(logs.info, [`Connected to bridge ${BRIDGE_ID} at ${BRIDGE_HOST} with 2 shade(s) and 1 Pico(s).`]);
     assert.equal(bridge.id, BRIDGE_ID);
     bridge.stop();
     await until(() => fake.open.length === 0);
     assert.deepEqual(events.online, [true, false]);
+  });
+
+  it("reports Picos and follows their button events without sending commands", async () => {
+    const { bridge, events, fake } = createBridge();
+    bridge.start();
+    await until(() => bridge.isOnline);
+
+    assert.deepEqual(events.picos[0].map((pico) => [pico.name, pico.serial, pico.device, pico.buttons.map((button) => button.name)]), [
+      ["Living Room Pico", "81234567", "/device/12", ["On", "Raise", "Favorite", "Lower", "Off"]]
+    ]);
+    const subscribed = fake.requests.filter((request) => request.message.CommuniqueType === "SubscribeRequest").map((request) => request.message.Header.Url);
+    assert.deepEqual(subscribed.filter((url) => url.startsWith("/button")).sort(), BUTTONS.map((button) => `${button.href}/status/event`).sort());
+
+    fake.buttonEvent("/button/105", "Press");
+    fake.buttonEvent("/button/105", "Release");
+    fake.open[0].send({ Header: { Url: "/button/102/status/event" }, Body: { ButtonStatus: { Button: { href: "/button/102" }, ButtonEvent: { EventType: "Press" } } } });
+    fake.open[0].send({ Header: { Url: "/button/102/status/event" }, Body: { ButtonStatus: { Button: { href: "/button/102" } } } });
+    fake.open[0].send({ Header: { Url: "/button/102/status/event" } });
+    await until(() => events.buttons.length === 3);
+    await settle();
+    assert.deepEqual(events.buttons, [["/button/105", "Press"], ["/button/105", "Release"], ["/button/102", "Press"]]);
+    assert.equal(fake.requests.filter((request) => !["ReadRequest", "SubscribeRequest"].includes(request.message.CommuniqueType)).length, 0);
+    bridge.stop();
+  });
+
+  it("subscribes to buttons again after a reconnect", async () => {
+    const { bridge, events, fake } = createBridge();
+    bridge.start();
+    await until(() => bridge.isOnline);
+    fake.drop();
+    await until(() => events.online.length === 3);
+
+    fake.buttonEvent("/button/104", "Press");
+    await until(() => events.buttons.length === 1);
+    assert.equal(fake.requests.filter((request) => request.message.Header.Url === "/button/104/status/event").length, 2);
+    bridge.stop();
+  });
+
+  it("still connects the shades when Pico buttons cannot be read or followed", async () => {
+    const fake = new FakeBridge();
+    fake.failures.set("/button", "500 InternalServerError");
+    const { bridge, events, logs } = createBridge(fake);
+    bridge.start();
+    await until(() => bridge.isOnline);
+    assert.equal(events.shades[0].length, 2);
+    assert.deepEqual(events.picos, [undefined]);
+    assert.ok(logs.warn.includes(`Bridge ${BRIDGE_ID}: could not read Pico buttons: /button failed: 500 InternalServerError: Nope`));
+    bridge.stop();
+
+    const other = new FakeBridge();
+    other.failures.set("/button/103/status/event", "400 BadRequest");
+    const second = createBridge(other);
+    second.bridge.start();
+    await until(() => second.bridge.isOnline);
+    assert.equal(second.events.picos[0][0].buttons.length, 5);
+    assert.ok(second.logs.warn.includes(`Bridge ${BRIDGE_ID}: could not follow Living Room Pico button 1: /button/103/status/event failed: 400 BadRequest: Nope`));
+    second.bridge.stop();
+  });
+
+  it("treats an empty button list as no Picos and skips it when there are no Picos", async () => {
+    const fake = new FakeBridge();
+    fake.buttons = undefined;
+    const { bridge, events } = createBridge(fake);
+    bridge.start();
+    await until(() => bridge.isOnline);
+    assert.deepEqual(events.picos, [[]]);
+    bridge.stop();
+
+    const bare = new FakeBridge();
+    bare.devices = bare.devices.filter((device) => !device.DeviceType.startsWith("Pico"));
+    const second = createBridge(bare);
+    second.bridge.start();
+    await until(() => second.bridge.isOnline);
+    assert.deepEqual(second.events.picos, [[]]);
+    assert.equal(bare.requests.some((request) => request.message.Header.Url === "/button"), false);
+    second.bridge.stop();
   });
 
   it("follows live level changes from subscriptions and untagged updates", async () => {
@@ -227,6 +307,61 @@ describe("parseShades", () => {
 
     for (const type of ["SerenaTiltOnlyWoodBlind", "Pico3ButtonRaiseLower", "SmartBridge", "WallDimmer", "TiltShade"]) {
       assert.equal(isShadeType(type), false, type);
+    }
+  });
+});
+
+describe("parsePicos", () => {
+  it("groups buttons by Pico, labels them by model, and orders them top to bottom", () => {
+    const devices = [
+      ...DEVICES,
+      { DeviceType: "Pico2Button", href: "/device/30", Name: "Solo", ButtonGroups: [{ href: "/buttongroup/9" }] },
+      { DeviceType: "Pico4Button2Group", href: "/device/31", SerialNumber: 9, FullyQualifiedName: ["Den", "Remote"], ButtonGroups: [{ href: "/buttongroup/10" }, { href: "/buttongroup/11" }] },
+      { DeviceType: "PicoNew", href: "/device/32", SerialNumber: 10, ButtonGroups: [{ href: "/buttongroup/12" }, null, { href: "/buttongroup/99" }] },
+      { DeviceType: "Pico3Button", href: "/device/33", ButtonGroups: [{ href: "/buttongroup/13" }], AddressedState: "Unaddressed" },
+      { DeviceType: "Pico3Button", href: "/device/34", ButtonGroups: "nope" },
+      { DeviceType: "Pico3Button", ButtonGroups: [{ href: "/buttongroup/13" }] },
+      null
+    ];
+    const buttons = [
+      ...BUTTONS,
+      { href: "/button/301", ButtonNumber: 2, Parent: { href: "/buttongroup/9" } },
+      { href: "/button/300", ButtonNumber: 0, Parent: { href: "/buttongroup/9" } },
+      { href: "/button/312", ButtonNumber: 4, Parent: { href: "/buttongroup/11" } },
+      { href: "/button/311", ButtonNumber: 3, Parent: { href: "/buttongroup/11" } },
+      { href: "/button/310", ButtonNumber: 1, Parent: { href: "/buttongroup/10" } },
+      { href: "/button/320", ButtonNumber: 7, Parent: { href: "/buttongroup/12" }, Name: " Top " },
+      { href: "/button/321", ButtonNumber: 2, Parent: { href: "/buttongroup/12" }, Name: "" },
+      { href: "/button/330", ButtonNumber: 1, Parent: { href: "/buttongroup/13" } },
+      { href: "/button/399", ButtonNumber: 1.5, Parent: { href: "/buttongroup/12" } },
+      { href: "/button/398", Parent: { href: "/buttongroup/12" } },
+      { ButtonNumber: 1, Parent: { href: "/buttongroup/12" } },
+      { href: "/button/397", ButtonNumber: 1 },
+      null
+    ];
+
+    assert.deepEqual(parsePicos({ Devices: devices }, { Buttons: buttons }).map((pico) => [pico.name, pico.serial, pico.model, pico.buttons.map((button) => [button.button, button.name])]), [
+      ["Living Room Pico", "81234567", "PJ2-3BRL-GXX-X01", [
+        ["/button/102", "On"], ["/button/105", "Raise"], ["/button/103", "Favorite"], ["/button/106", "Lower"], ["/button/104", "Off"]
+      ]],
+      ["Solo", "/device/30", "Pico2Button", [["/button/300", "On"], ["/button/301", "Off"]]],
+      ["Den Remote", "9", "Pico4Button2Group", [
+        ["/button/310", "Group 1 Button 1"], ["/button/311", "Group 2 Button 1"], ["/button/312", "Group 2 Button 2"]
+      ]],
+      ["Pico", "10", "PicoNew", [["/button/321", "Button 2"], ["/button/320", "Top"]]]
+    ]);
+    assert.deepEqual(parsePicos({ Devices: devices }, undefined), []);
+    assert.deepEqual(parsePicos(undefined, { Buttons: buttons }), []);
+    assert.deepEqual(parsePicos({ Devices: DEVICES }, { Buttons: "nope" }), []);
+  });
+
+  it("recognizes Pico device types", () => {
+    for (const type of ["Pico2Button", "Pico3ButtonRaiseLower", "Pico4ButtonScene"]) {
+      assert.equal(isPicoType(type), true, type);
+    }
+
+    for (const type of ["TriathlonRollerShade", "SmartBridge", "WallDimmer"]) {
+      assert.equal(isPicoType(type), false, type);
     }
   });
 });
