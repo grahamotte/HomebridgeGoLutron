@@ -25,6 +25,7 @@ import {
   type BridgeTiming
 } from "./settings.js";
 import { CredentialStore, type BridgeRecord } from "./store.js";
+import { withPluginPrefix } from "./logger.js";
 
 interface Context {
   bridge?: string;
@@ -54,12 +55,15 @@ export class GoLutronPlatform implements DynamicPlatformPlugin {
   private stopped = false;
   private reportedMissing = false;
 
+  public readonly log: Logging;
+
   constructor(
-    public readonly log: Logging,
+    log: Logging,
     public readonly config: PlatformConfig,
     public readonly api: API,
     private readonly dependencies: PlatformDependencies = {},
   ) {
+    this.log = withPluginPrefix(log);
     this.Service = api.hap.Service;
     this.Characteristic = api.hap.Characteristic;
     this.timing = { ...DEFAULT_TIMING, ...dependencies.timing };
